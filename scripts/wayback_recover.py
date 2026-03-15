@@ -40,8 +40,9 @@ Notes
 """
 
 import argparse
+import hashlib
 import logging
-import os
+import posixpath
 import re
 import sys
 import time
@@ -120,6 +121,7 @@ def fetch_with_retry(url: str, *, stream: bool = False) -> requests.Response:
                 retry_after = delay
             log.warning("HTTP %d on attempt %d/%d for %s — waiting %ds",
                         resp.status_code, attempt, MAX_RETRIES, url, retry_after)
+            resp.close()  # release connection before sleeping
             if attempt == MAX_RETRIES:
                 resp.raise_for_status()
             time.sleep(retry_after)
@@ -139,19 +141,22 @@ def fetch_with_retry(url: str, *, stream: bool = False) -> requests.Response:
 
 def query_cdx(index_url: str) -> list[dict]:
     """
-    Query the CDX API for all HTTP-200 snapshots of *index_url* and its sub-pages.
+    Query the CDX API for all HTTP-200 HTML snapshots of *index_url* and its sub-pages.
 
     Returns a list of dicts with keys: timestamp, original, mimetype, statuscode,
-    digest, length.  Only the most recent snapshot per URL is kept.
+    digest, length.  Only the most recent snapshot per URL is kept (sort=reverse
+    ensures collapse=urlkey retains the latest capture for each URL).
     """
-    params = {
-        "url": index_url.rstrip("/") + "/*",
-        "matchType": "prefix",
-        "output": "json",
-        "filter": "statuscode:200",
-        "collapse": "urlkey",   # one result per unique URL
-        "fl": "timestamp,original,mimetype,statuscode,digest,length",
-    }
+    params = [
+        ("url",       index_url.rstrip("/") + "/*"),
+        ("matchType", "prefix"),
+        ("output",    "json"),
+        ("filter",    "statuscode:200"),
+        ("filter",    "mimetype:text/html"),  # skip images/CSS/JS from CDX results
+        ("collapse",  "urlkey"),              # one result per unique URL …
+        ("sort",      "reverse"),             # … keeping the most recent timestamp
+        ("fl",        "timestamp,original,mimetype,statuscode,digest,length"),
+    ]
     log.info("Querying CDX API for: %s", index_url)
     resp = fetch_with_retry(CDX_API + "?" + urllib.parse.urlencode(params))
     time.sleep(INTER_REQUEST_DELAY)
@@ -164,7 +169,7 @@ def query_cdx(index_url: str) -> list[dict]:
     # First row is the header when output=json
     header = rows[0]
     records = [dict(zip(header, row)) for row in rows[1:]]
-    log.info("CDX returned %d snapshots", len(records))
+    log.info("CDX returned %d HTML snapshots", len(records))
     return records
 
 
@@ -226,10 +231,19 @@ def extract_assets(html: str, base_url: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _safe_filename(url: str) -> str:
-    """Derive a safe relative file path from an asset URL."""
+    """
+    Derive a safe relative file path from an asset URL.
+
+    Path components are split and filtered to strip ``..`` and ``.`` entries,
+    preventing directory traversal even with double-encoded sequences
+    (e.g. ``%252e%252e``).  The hard security boundary is the ``relative_to``
+    check in :func:`download_asset`.
+    """
     parsed = urllib.parse.urlparse(url)
-    # Strip leading slash; replace path separators on Windows
-    rel = parsed.path.lstrip("/")
+    # Decode percent-encoding once, then split into components and drop traversal
+    clean_path = urllib.parse.unquote(parsed.path)
+    parts = [p for p in clean_path.split("/") if p and p not in (".", "..")]
+    rel = "/".join(parts)
     if not rel:
         rel = "index.html"
     return rel
@@ -241,10 +255,21 @@ def download_asset(asset_url: str, assets_dir: Path, timestamp: str) -> str | No
     *assets_dir*, preserving relative directory structure.
 
     Returns the local relative path on success, None on failure.
+
+    Path traversal attempts (e.g. ``../../etc/passwd``) are detected and
+    rejected: the resolved destination must be inside *assets_dir*.
     """
     wb_url = wayback_url(timestamp, asset_url)
     rel_path = _safe_filename(asset_url)
-    dest = assets_dir / rel_path
+    dest = (assets_dir / rel_path).resolve()
+
+    # Security check: dest must be inside assets_dir
+    try:
+        dest.relative_to(assets_dir.resolve())
+    except ValueError:
+        log.warning("Skipping asset with unsafe path (traversal detected): %s", asset_url)
+        return None
+
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists():
@@ -270,21 +295,33 @@ def download_asset(asset_url: str, assets_dir: Path, timestamp: str) -> str | No
 
 def rewrite_asset_urls(html: str, asset_map: dict[str, str]) -> str:
     """
-    Replace each original asset URL in *html* with its local relative path
-    from *asset_map* (original_url → local_rel_path).
+    Rewrite asset ``src``/``href`` attribute values in *html* using BeautifulSoup.
 
-    Each absolute URL is matched in both its absolute form
-    (``https://example.com/path``) and its root-relative form (``/path``),
-    so that HTML with relative ``src``/``href`` attributes is also handled.
+    Only ``<img src>``, ``<link href>``, and ``<script src>`` attributes are
+    updated, avoiding accidental replacement of text content or unrelated links.
+    *asset_map* maps absolute original URLs to local relative paths; both the
+    absolute form and the root-relative path form are matched.
     """
+    if not asset_map:
+        return html
+
+    # Build a fast lookup covering absolute URLs and their root-relative paths
+    lookup: dict[str, str] = {}
     for original_url, local_path in asset_map.items():
+        lookup[original_url] = local_path
         parsed = urllib.parse.urlparse(original_url)
-        # Replace the absolute URL first (more specific)
-        html = html.replace(original_url, local_path)
-        # Also replace the root-relative path (e.g. /wp-content/uploads/…)
         if parsed.path and parsed.path != "/":
-            html = html.replace(parsed.path, local_path)
-    return html
+            # Only add the path form if it doesn't collide with another entry
+            lookup.setdefault(parsed.path, local_path)
+
+    soup = BeautifulSoup(html, "lxml")
+    for tag, attr in [("img", "src"), ("link", "href"), ("script", "src")]:
+        for element in soup.find_all(tag):
+            val = element.get(attr, "")
+            if val in lookup:
+                element[attr] = lookup[val]
+
+    return str(soup)
 
 
 # ---------------------------------------------------------------------------
@@ -418,11 +455,6 @@ def run_full(index_url: str, output_dir: Path) -> int:
             failures.append(original)
             continue
 
-        soup = BeautifulSoup(html, "lxml")
-        title = extract_post_title(soup)
-        content_raw = extract_post_content(soup)
-        pub_date = extract_pub_date(soup)
-
         # --- asset extraction and download ---
         assets = extract_assets(html, original)
         asset_map: dict[str, str] = {}
@@ -431,13 +463,23 @@ def run_full(index_url: str, output_dir: Path) -> int:
             if local_path:
                 asset_map[asset_url] = local_path
 
-        content_rewritten = rewrite_asset_urls(content_raw, asset_map)
+        # Rewrite asset URLs in the full page HTML (attribute-safe, via BS4)
+        html_rewritten = rewrite_asset_urls(html, asset_map)
 
-        # --- save HTML to disk ---
+        # Extract post metadata and content from the rewritten HTML
+        soup_rewritten = BeautifulSoup(html_rewritten, "lxml")
+        title = extract_post_title(soup_rewritten)
+        content_rewritten = extract_post_content(soup_rewritten)
+        pub_date = extract_pub_date(soup_rewritten)
+
+        # --- save rewritten HTML to disk ---
+        # Include a short URL hash to avoid collisions between URLs that share
+        # the same final path segment (e.g. /blog/post/ vs /news/post/).
+        url_hash = hashlib.sha256(original.encode()).hexdigest()[:8]
         safe_name = re.sub(r"[^\w\-]", "_", original.rstrip("/").split("/")[-1] or "index")
         safe_name = safe_name.rstrip(".")  # remove any trailing dots
-        html_file = html_dir / f"{timestamp}_{safe_name}.html"
-        html_file.write_text(html, encoding="utf-8")
+        html_file = html_dir / f"{timestamp}_{safe_name}_{url_hash}.html"
+        html_file.write_text(html_rewritten, encoding="utf-8")
 
         posts.append({
             "title": title,
