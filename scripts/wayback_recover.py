@@ -79,6 +79,103 @@ def unwrap_wayback_url(url: str) -> str:
         return unquote(m2.group(1))
     return url
 
+
+def parse_wayback_url(url: str) -> tuple:
+    """
+    Parse a Wayback Machine URL and extract timestamp and original URL.
+
+    Returns:
+        (timestamp, original_url) if URL is a Wayback URL
+        (None, None) if URL is not a Wayback URL
+
+    Examples:
+        'https://web.archive.org/web/20251113082400/https://example.com/'
+        -> ('20251113082400', 'https://example.com/')
+
+        'https://example.com/'
+        -> (None, None)
+    """
+    pattern = r'https?://web\.archive\.org/web/(\d{1,14})(?:id_|if_|js_|cs_|im_)?/(https?://.+)$'
+    match = re.match(pattern, url)
+    if match:
+        return (match.group(1), unquote(match.group(2)))
+    return (None, None)
+
+
+def is_blog_post_url(url: str) -> bool:
+    """
+    Determine if a URL is likely a blog post/article.
+
+    Returns True only for actual blog posts, False for everything else.
+    """
+    url_lower = url.lower()
+
+    reject_patterns = [
+        '/shop/',
+        '/product/',
+        '/cart/',
+        '/checkout/',
+        '/my-account/',
+        '/category/',
+        '/tag/',
+        '/author/',
+        '/page/',
+        '/feed/',
+        '/wp-admin/',
+        '/wp-content/',
+        '/wp-includes/',
+        '/wp-json/',
+        'xmlrpc.php',
+        '?',
+    ]
+
+    if any(pattern in url_lower for pattern in reject_patterns):
+        return False
+
+    static_pages = [
+        '/about',
+        '/contact',
+        '/privacy',
+        '/terms',
+        '/disclaimer',
+        '/sitemap',
+    ]
+
+    if any(url_lower.rstrip('/').endswith(page) for page in static_pages):
+        return False
+
+    if 'currylovers.co.za' not in url_lower:
+        return False
+
+    parsed = urlparse(url)
+    path = parsed.path.strip('/')
+
+    if not path:
+        return False
+
+    return True
+
+
+def is_useful_asset(url: str) -> bool:
+    """
+    Determine if an asset is worth downloading.
+    ONLY download featured images from /wp-content/uploads/
+    """
+    url_lower = url.lower()
+
+    if '/wp-content/uploads/' not in url_lower:
+        return False
+
+    image_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
+    if not any(url_lower.endswith(ext) for ext in image_extensions):
+        return False
+
+    # Reject thumbnails and resized versions (e.g. image-150x150.jpg)
+    if re.search(r'-\d+x\d+\.(jpg|jpeg|png|webp|gif)$', url_lower):
+        return False
+
+    return True
+
 # Build CDX query URL helper
 import urllib.parse
 
@@ -199,46 +296,29 @@ def extract_links_from_index_html(archive_html: str) -> list:
     return sorted(urls)
 
 def extract_assets_from_html(html: str, base_url: str) -> set:
+    """Parse html and return ONLY featured/content images from wp-content/uploads/."""
     soup = BeautifulSoup(html, "html.parser")
     assets = set()
     for img in soup.find_all("img"):
-        src = img.get("src")
+        src = img.get("src", "")
         if not src:
             continue
         src = src.strip()
         if src.startswith("data:"):
             continue
-        if src.startswith("//"):
+        # Handle Wayback-rewritten URLs
+        if src.startswith("/web/"):
+            src = f"https://web.archive.org{src}"
+        elif src.startswith("//"):
             src = "https:" + src
-        if src.startswith("/"):
+        elif src.startswith("/"):
             parsed = urlparse(base_url)
             src = f"{parsed.scheme}://{parsed.netloc}{src}"
         if src.startswith("http"):
-            assets.add(src)
-    for script in soup.find_all("script"):
-        src = script.get("src")
-        if not src:
-            continue
-        src = src.strip()
-        if src.startswith("//"):
-            src = "https:" + src
-        if src.startswith("/"):
-            parsed = urlparse(base_url)
-            src = f"{parsed.scheme}://{parsed.netloc}{src}"
-        if src.startswith("http"):
-            assets.add(src)
-    for link in soup.find_all("link"):
-        href = link.get("href")
-        if not href:
-            continue
-        href = href.strip()
-        if href.startswith("//"):
-            href = "https:" + href
-        if href.startswith("/"):
-            parsed = urlparse(base_url)
-            href = f"{parsed.scheme}://{parsed.netloc}{href}"
-        if href.startswith("http"):
-            assets.add(href)
+            # Unwrap Wayback-wrapped asset URLs to get the original URL
+            original_src = unwrap_wayback_url(src)
+            if is_useful_asset(original_src):
+                assets.add(src)
     return assets
 
 def download_asset(archived_asset_url: str, dest_dir: str) -> str | None:
@@ -361,47 +441,58 @@ def write_wxr(items: list, output_dir: str):
         logging.error("Failed to write WXR: %s", e)
 
 def run_dry(index_url: str):
-    # If given a wayback index URL, unwrap it
-    orig_index = unwrap_wayback_url(index_url)
-    # If index is still a wayback URL (e.g., was full wayback URL), try to fetch the archived HTML directly
-    try:
-        logging.info("Fetching index page %s", index_url)
-        resp = fetch_with_retry(index_url, max_retries=2, backoff=1.0)
-        if resp is None:
-            logging.error("Cannot fetch index page; aborting.")
-            return 1
-        index_html = resp.text
-    except Exception as e:
-        logging.error("Failed to fetch index page: %s", e)
+    # Detect if it's a Wayback URL and extract timestamp + original URL
+    timestamp, original_url = parse_wayback_url(index_url)
+    if timestamp and original_url:
+        logging.info("Detected Wayback URL — fetching directly from timestamp %s", timestamp)
+    else:
+        logging.info("Regular URL — fetching index page directly")
+    resp = fetch_with_retry(index_url, max_retries=2, backoff=1.0)
+    if resp is None:
+        logging.error("Cannot fetch index page; aborting.")
         return 1
+    index_html = resp.text
     article_urls = extract_links_from_index_html(index_html)
-    logging.info("Discovered %d candidate article URLs", len(article_urls))
+    article_urls = [u for u in article_urls if is_blog_post_url(u)]
+    logging.info("Discovered %d candidate blog post URLs after filtering", len(article_urls))
     if not article_urls:
-        logging.error("No article URLs found under index page; aborting.")
+        logging.error("No blog post URLs found under index page; aborting.")
         return 1
     for orig in article_urls:
         logging.info("Processing article %s", orig)
-        item = process_article(orig, mode='dry-run', output_dir='output')
+        item = process_article(orig, mode='dry-run', output_dir='output', target_ts=timestamp)
         if item:
             print('Found post:', orig)
     logging.info('Dry-run complete.')
     return 0
 
 def run_full(index_url: str, output_dir: str):
+    # Detect if it's a Wayback URL and extract timestamp + original URL
+    timestamp, original_url = parse_wayback_url(index_url)
+    if timestamp and original_url:
+        logging.info("Detected Wayback URL — fetching directly from timestamp %s", timestamp)
+    else:
+        logging.info("Regular URL — fetching index page directly")
     resp = fetch_with_retry(index_url, max_retries=2, backoff=1.0)
     if resp is None:
         logging.error('Cannot fetch index page; aborting.')
         return 1
     index_html = resp.text
     article_urls = extract_links_from_index_html(index_html)
+    article_urls = [u for u in article_urls if is_blog_post_url(u)]
+    logging.info("Found %d blog post URLs after filtering", len(article_urls))
+    if not article_urls:
+        logging.error("No blog post URLs found; aborting.")
+        return 1
     items = []
     for orig in article_urls:
         logging.info('Processing article %s', orig)
-        wxr_item = process_article(orig, mode='full', output_dir=output_dir, target_ts=None)
+        wxr_item = process_article(orig, mode='full', output_dir=output_dir, target_ts=timestamp)
         if wxr_item:
             items.append(wxr_item)
         time.sleep(0.5)
     write_wxr(items, output_dir)
+    logging.info("Recovery complete — %d articles exported to WXR", len(items))
     return 0
 
 def main():
