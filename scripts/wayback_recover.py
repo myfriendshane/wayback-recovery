@@ -22,6 +22,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # Config
 CDX_API = "https://web.archive.org/cdx/search/cdx"
+WAYBACK_BASE = "https://web.archive.org/web"
 WAYBACK_ARCHIVE_TEMPLATE = "https://web.archive.org/web/{timestamp}/{url}"
 USER_AGENT = "wayback-recover-bot/1.0 (https://github.com/myfriendshane/wayback-recovery)"
 REQUEST_TIMEOUT = 45  # seconds
@@ -161,6 +162,19 @@ def archived_url(timestamp: str, original: str) -> str:
     return WAYBACK_ARCHIVE_TEMPLATE.format(timestamp=timestamp, url=original)
 
 
+def wayback_url(timestamp: str, original: str) -> str:
+    """Construct a Wayback Machine URL that serves the raw archived resource.
+
+    Prevents double-wrapping when *original* is already a Wayback URL.
+    """
+    if original.startswith("https://web.archive.org/web/") or original.startswith("/web/"):
+        # Already a Wayback URL; make it absolute if needed
+        if original.startswith("/web/"):
+            return f"https://web.archive.org{original}"
+        return original
+    return f"{WAYBACK_BASE}/{timestamp}if_/{original}"
+
+
 def extract_links_from_index_html(archive_html: str) -> list:
     from urllib.parse import urlparse, unquote as _unquote
     ALLOWED_HOSTS = {"currylovers.co.za", "www.currylovers.co.za"}
@@ -198,50 +212,91 @@ def extract_links_from_index_html(archive_html: str) -> list:
             urls.add("https://www.currylovers.co.za" + href.split("#")[0].rstrip("/"))
     return sorted(urls)
 
-def extract_assets_from_html(html: str, base_url: str) -> set:
+def extract_assets(html: str, base_url: str) -> list[str]:
+    """Parse *html* and return a deduplicated list of absolute asset URLs
+    (images, stylesheets, scripts) that belong to the same host as *base_url*
+    or are already served from the Wayback Machine.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    assets = set()
-    for img in soup.find_all("img"):
-        src = img.get("src")
-        if not src:
-            continue
-        src = src.strip()
-        if src.startswith("data:"):
-            continue
-        if src.startswith("//"):
-            src = "https:" + src
-        if src.startswith("/"):
-            parsed = urlparse(base_url)
-            src = f"{parsed.scheme}://{parsed.netloc}{src}"
-        if src.startswith("http"):
-            assets.add(src)
-    for script in soup.find_all("script"):
-        src = script.get("src")
-        if not src:
-            continue
-        src = src.strip()
-        if src.startswith("//"):
-            src = "https:" + src
-        if src.startswith("/"):
-            parsed = urlparse(base_url)
-            src = f"{parsed.scheme}://{parsed.netloc}{src}"
-        if src.startswith("http"):
-            assets.add(src)
-    for link in soup.find_all("link"):
-        href = link.get("href")
-        if not href:
-            continue
-        href = href.strip()
-        if href.startswith("//"):
-            href = "https:" + href
-        if href.startswith("/"):
-            parsed = urlparse(base_url)
-            href = f"{parsed.scheme}://{parsed.netloc}{href}"
-        if href.startswith("http"):
-            assets.add(href)
-    return assets
+    parsed_base = urllib.parse.urlparse(base_url)
+    found: list[str] = []
+    seen: set[str] = set()
+
+    selectors = [
+        ("img",    "src"),
+        ("link",   "href"),
+        ("script", "src"),
+    ]
+    for tag, attr in selectors:
+        for element in soup.find_all(tag):
+            raw = element.get(attr, "")
+            if not raw:
+                continue
+            raw = raw.strip()
+            if raw.startswith("data:"):
+                continue
+
+            # Handle Wayback-rewritten URLs (e.g. /web/20260125112801js_/https://...)
+            if raw.startswith("/web/"):
+                absolute = f"https://web.archive.org{raw}"
+            else:
+                absolute = urllib.parse.urljoin(base_url, raw)
+
+            parsed = urllib.parse.urlparse(absolute)
+
+            # Keep assets on the same host OR already served via Wayback
+            if parsed.netloc == "web.archive.org" or parsed.netloc == parsed_base.netloc:
+                if absolute not in seen:
+                    seen.add(absolute)
+                    found.append(absolute)
+
+    return found
+
+
+# Keep the old name as an alias for backward compatibility
+extract_assets_from_html = extract_assets
+
+def is_useful_asset(url: str) -> bool:
+    """Return True if *url* is worth downloading.
+
+    Only content images are kept; JS, CSS, fonts, tracking pixels, and
+    WordPress API/admin endpoints are skipped.
+    """
+    junk_patterns = [
+        'xmlrpc.php',
+        '/feed/',
+        'comments/feed',
+        'wp-json/oembed',
+        'wp-json/wp/v2',
+        'facebook.com/tr',
+        'google-analytics',
+        'googletagmanager.com',
+        'gtag/js',
+        'platform.js',
+        '.woff', '.woff2', '.ttf', '.eot',
+        '.js',
+        '.css',
+        'capi-automation',
+        'sweetalert',
+        'jquery',
+        'wp-includes/js',
+        'wp-content/plugins',
+        'wp-content/themes',
+    ]
+
+    # Always keep content images from wp-content/uploads
+    if '/wp-content/uploads/' in url.lower() and any(
+        url.lower().endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg')
+    ):
+        return True
+
+    return not any(pattern in url.lower() for pattern in junk_patterns)
+
 
 def download_asset(archived_asset_url: str, dest_dir: str) -> str | None:
+    if not is_useful_asset(archived_asset_url):
+        logging.debug("Skipping junk asset: %s", archived_asset_url)
+        return None
     r = fetch_with_retry(archived_asset_url, max_retries=2, backoff=1.0)
     if r is None:
         return None
@@ -322,8 +377,8 @@ def process_article(orig: str, mode: str, output_dir: str, target_ts: str | None
             break
     if not pubdate:
         pubdate = chosen_ts
-    assets = extract_assets_from_html(html, orig)
-    archived_asset_urls = [archived_url(chosen_ts, a) for a in assets]
+    assets = extract_assets(html, orig)
+    archived_asset_urls = [wayback_url(chosen_ts, a) for a in assets]
     logging.info("Found %d assets for this post", len(archived_asset_urls))
     local_asset_paths = []
     if mode == 'full':
