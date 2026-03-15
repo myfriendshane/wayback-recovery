@@ -16,7 +16,8 @@ import re
 import hashlib
 import sys
 from urllib.parse import urlparse, urljoin, unquote
-from bs4 import BeautifulSoup\nimport post_filters
+from bs4 import BeautifulSoup
+import post_filters
 from xml.sax.saxutils import escape as xml_escape
 
 # Config
@@ -268,7 +269,11 @@ def make_minimal_wxr_item(title: str, link: str, pubdate: str, content_html: str
     item.append("</item>")
     return "\n".join(item)
 
-def process_article(orig: str, mode: str, output_dir: str, target_ts: str | None = None):\n    # skip known non-post URLs early\n    if post_filters.is_blacklisted_url(orig):\n        logging.info('Skipping blacklisted URL: %s', orig)\n        return None
+def process_article(orig: str, mode: str, output_dir: str, target_ts: str | None = None):
+    # skip known non-post URLs early
+    if post_filters.is_blacklisted_url(orig):
+        logging.info('Skipping blacklisted URL: %s', orig)
+        return None
     rows = query_cdx(orig, limit=100)
     if not rows:
         logging.warning("No CDX snapshots found for %s; skipping", orig)
@@ -287,7 +292,14 @@ def process_article(orig: str, mode: str, output_dir: str, target_ts: str | None
     if resp is None:
         logging.warning("Failed to download archived HTML for %s; skipping", orig)
         return None
-    html = resp.text\n    # Verify this looks like a published post (skip pages like checkout/product/contact)\n    try:\n        if post_filters.is_blacklisted_url(orig):\n            logging.info('Skipping blacklisted URL after fetch: %s', orig)\n            return None\n        if not post_filters.is_likely_published_post(html, orig):\n            logging.info('Skipping non-post page (not a published post): %s', orig)\n            return None\n    except Exception as _e:\n        logging.warning('Post detection failed for %s: %s', orig, _e)\n
+    html = resp.text
+    # Verify this looks like a published post (skip pages like checkout/product/contact)
+    try:
+        if not post_filters.is_likely_published_post(html, orig):
+            logging.info('Skipping non-post page (not a published post): %s', orig)
+            return None
+    except Exception as _e:
+        logging.warning('Post detection failed for %s: %s', orig, _e)
     soup = BeautifulSoup(html, "html.parser")
     title_tag = soup.find("title")
     title = title_tag.get_text().strip() if title_tag else safe_filename_from_url(orig)
@@ -347,7 +359,7 @@ def run_dry(index_url: str):
         if resp is None:
             logging.error("Cannot fetch index page; aborting.")
             return 1
-        index_html = resp.text\n    # Verify this looks like a published post (skip pages like checkout/product/contact)\n    try:\n        if post_filters.is_blacklisted_url(orig):\n            logging.info('Skipping blacklisted URL after fetch: %s', orig)\n            return None\n        if not post_filters.is_likely_published_post(html, orig):\n            logging.info('Skipping non-post page (not a published post): %s', orig)\n            return None\n    except Exception as _e:\n        logging.warning('Post detection failed for %s: %s', orig, _e)\n
+        index_html = resp.text
     except Exception as e:
         logging.error("Failed to fetch index page: %s", e)
         return 1
@@ -369,7 +381,7 @@ def run_full(index_url: str, output_dir: str):
     if resp is None:
         logging.error('Cannot fetch index page; aborting.')
         return 1
-    index_html = resp.text\n    # Verify this looks like a published post (skip pages like checkout/product/contact)\n    try:\n        if post_filters.is_blacklisted_url(orig):\n            logging.info('Skipping blacklisted URL after fetch: %s', orig)\n            return None\n        if not post_filters.is_likely_published_post(html, orig):\n            logging.info('Skipping non-post page (not a published post): %s', orig)\n            return None\n    except Exception as _e:\n        logging.warning('Post detection failed for %s: %s', orig, _e)\n
+    index_html = resp.text
     article_urls = extract_links_from_index_html(index_html)
     items = []
     for orig in article_urls:
