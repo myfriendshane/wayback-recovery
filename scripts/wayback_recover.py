@@ -160,7 +160,10 @@ def query_cdx(original_url: str, limit: int = 50) -> list:
 def archived_url(timestamp: str, original: str) -> str:
     return WAYBACK_ARCHIVE_TEMPLATE.format(timestamp=timestamp, url=original)
 
+
 def extract_links_from_index_html(archive_html: str) -> list:
+    from urllib.parse import urlparse, unquote as _unquote
+    ALLOWED_HOSTS = {"currylovers.co.za", "www.currylovers.co.za"}
     soup = BeautifulSoup(archive_html, "html.parser")
     anchors = soup.find_all("a", href=True)
     urls = set()
@@ -168,21 +171,29 @@ def extract_links_from_index_html(archive_html: str) -> list:
         href = a["href"].strip()
         if not href:
             continue
-        # unwrap wayback links
+        # 1) relative wayback unwrap: /web/<ts>/https://...
         m = re.search(r"/web/\d{1,14}/(https?://.+)$", href)
         if m:
-            orig = unquote(m.group(1))
-            urls.add(orig)
+            orig = _unquote(m.group(1))
+            net = urlparse(orig).netloc.lower()
+            if net in ALLOWED_HOSTS:
+                urls.add(orig.split("#")[0].rstrip("/"))
             continue
+        # 2) full wayback-wrapped absolute link
         m2 = re.search(r"https?://web\.archive\.org/web/\d{1,14}/(https?://.+)$", href)
         if m2:
-            orig = unquote(m2.group(1))
-            urls.add(orig)
+            orig = _unquote(m2.group(1))
+            net = urlparse(orig).netloc.lower()
+            if net in ALLOWED_HOSTS:
+                urls.add(orig.split("#")[0].rstrip("/"))
             continue
+        # 3) absolute http(s) links in the index
         if href.startswith("http"):
-            if "currylovers.co.za" in href:
+            net = urlparse(href).netloc.lower()
+            if net in ALLOWED_HOSTS:
                 urls.add(href.split("#")[0].rstrip("/"))
             continue
+        # 4) site-relative links - map to canonical domain
         if href.startswith("/"):
             urls.add("https://www.currylovers.co.za" + href.split("#")[0].rstrip("/"))
     return sorted(urls)
