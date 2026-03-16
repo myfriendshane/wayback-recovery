@@ -19,7 +19,7 @@ Flags
   --index-url   The original site URL to recover (required).
   --output-dir  Directory to write recovered HTML, assets, and WXR (required).
   --mode        dry-run  — query CDX and list snapshots; no files written.
-                full     — download HTML, extract and download assets, write WXR.
+                full     — download HTML, extract images, write WXR.
 
 Exit codes
 ----------
@@ -36,13 +36,13 @@ Notes
   - Uses exponential back-off (up to MAX_RETRIES attempts) on transient errors.
   - Only the latest successful (HTTP 200) CDX snapshot is used per URL.
   - In full mode a minimal WXR file (wxr_output.xml) is written to --output-dir.
+  - Only images (featured + content) are downloaded, not CSS/JS.
   - You must own or have rights to the content you are recovering.
 """
 
 import argparse
 import hashlib
 import logging
-import posixpath
 import re
 import sys
 import time
@@ -139,6 +139,49 @@ def fetch_with_retry(url: str, *, stream: bool = False) -> requests.Response:
 # CDX — discover snapshots
 # ---------------------------------------------------------------------------
 
+# URL path fragments that indicate non-post pages to exclude.
+_EXCLUDE_PATH_FRAGMENTS = (
+    "/product/", "/shop/", "/cart/", "/checkout/", "/my-account/",
+    "/wp-admin/", "/wp-content/", "/wp-includes/", "/wp-json/",
+    "/feed/", "/author/", "/category/", "/tag/", "/page/",
+    "/search/", "/comments/", "/trackback/",
+    "/info/", "/about/", "/contact/", "/privacy/", "/terms/",
+)
+
+
+def should_process_url(url: str) -> tuple[bool, str]:
+    """
+    Decide whether *url* looks like a blog post worth recovering.
+
+    Returns ``(True, "")`` if the URL should be processed, or
+    ``(False, reason)`` with a short human-readable reason string if it
+    should be skipped.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not parse URL %r: %s — skipping", url, exc)
+        return False, "unparseable URL"
+
+    path = parsed.path.lower()
+
+    # Reject URLs with query strings — not clean post permalinks.
+    if parsed.query:
+        return False, "has query string"
+
+    for fragment in _EXCLUDE_PATH_FRAGMENTS:
+        if fragment in path:
+            return False, f"excluded path fragment '{fragment}'"
+
+    # A valid post permalink ends with a slug segment (non-empty path).
+    # Reject bare root or paths with no real slug.
+    clean = path.strip("/")
+    if not clean:
+        return False, "root URL"
+
+    return True, ""
+
+
 def query_cdx(index_url: str) -> list[dict]:
     """
     Query the CDX API for all HTTP-200 HTML snapshots of *index_url* and its sub-pages.
@@ -146,6 +189,8 @@ def query_cdx(index_url: str) -> list[dict]:
     Returns a list of dicts with keys: timestamp, original, mimetype, statuscode,
     digest, length.  Only the most recent snapshot per URL is kept (sort=reverse
     ensures collapse=urlkey retains the latest capture for each URL).
+
+    URLs that do not look like blog posts are filtered out before returning.
     """
     params = [
         ("url",       index_url.rstrip("/") + "/*"),
@@ -169,13 +214,53 @@ def query_cdx(index_url: str) -> list[dict]:
     # First row is the header when output=json
     header = rows[0]
     records = [dict(zip(header, row)) for row in rows[1:]]
-    log.info("CDX returned %d HTML snapshots", len(records))
-    return records
+    total = len(records)
+    log.info("CDX returned %d URLs", total)
+
+    # Filter for blog posts only and collect exclusion stats.
+    log.info("Filtering URLs for blog posts only...")
+    kept: list[dict] = []
+    exclusion_counts: dict[str, int] = {}
+    for rec in records:
+        include, reason = should_process_url(rec["original"])
+        if include:
+            kept.append(rec)
+        else:
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+            log.debug("Excluded %s — %s", rec["original"], reason)
+
+    excluded = total - len(kept)
+    if excluded:
+        parts = ", ".join(f"{r}: {c}" for r, c in sorted(exclusion_counts.items()))
+        log.info("Excluded %d URLs (%s)", excluded, parts)
+    log.info("Processing %d blog posts", len(kept))
+    return kept
 
 
 # ---------------------------------------------------------------------------
-# HTML download and asset extraction
+# HTML download and image extraction
 # ---------------------------------------------------------------------------
+
+# Only images (featured + content) are downloaded, not CSS/JS.
+
+# Image URL fragments that indicate WordPress theme / UI images to skip.
+# Directory-based: matched against the full URL path.
+_SKIP_IMAGE_DIR_FRAGMENTS = (
+    "/wp-content/themes/",
+    "/wp-includes/",
+)
+
+# Name-based: matched only against the image filename (last path component),
+# to avoid false positives on upload paths like /uploads/logo-design-tips.jpg.
+_SKIP_IMAGE_NAME_FRAGMENTS = (
+    "logo",
+    "icon",
+    "sprite",
+    "button",
+    "avatar",
+    "badge",
+)
+
 
 def wayback_url(timestamp: str, original: str) -> str:
     """Construct a Wayback Machine URL that serves the raw archived resource."""
@@ -194,36 +279,121 @@ def fetch_html(timestamp: str, original: str) -> str | None:
         return None
 
 
-def extract_assets(html: str, base_url: str) -> list[str]:
+def extract_images(html: str, base_url: str) -> dict:
     """
-    Parse *html* and return a deduplicated list of absolute asset URLs
-    (images, stylesheets, scripts) that belong to the same host as *base_url*.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    parsed_base = urllib.parse.urlparse(base_url)
-    found: list[str] = []
-    seen: set[str] = set()
+    Parse *html* and return a dict with keys:
 
-    selectors = [
-        ("img",    "src"),
-        ("link",   "href"),
-        ("script", "src"),
-    ]
-    for tag, attr in selectors:
-        for element in soup.find_all(tag):
-            raw = element.get(attr, "")
+    - ``"featured"``: absolute URL of the featured image, or ``None``.
+    - ``"content"``: deduplicated list of absolute content-image URLs.
+
+    Only ``<img>`` tags are considered (no ``<link>`` or ``<script>``).
+    Theme images, WordPress UI images, data: URIs, and off-host images are
+    excluded.  Detailed counts are logged.
+    """
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to parse HTML from %s: %s", base_url, exc)
+        return {"featured": None, "content": []}
+
+    try:
+        parsed_base = urllib.parse.urlparse(base_url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not parse base URL %r: %s", base_url, exc)
+        return {"featured": None, "content": []}
+
+    # --- Featured image detection ---
+    featured_img: str | None = None
+    featured_method: str = ""
+
+    try:
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            featured_img = urllib.parse.urljoin(base_url, og["content"])
+            featured_method = "og:image"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Error reading og:image from %s: %s", base_url, exc)
+
+    if not featured_img:
+        try:
+            wp_thumb = soup.find(
+                "img",
+                class_=re.compile(r"wp-post-image|attachment-post-thumbnail"),
+            )
+            if wp_thumb and wp_thumb.get("src"):
+                featured_img = urllib.parse.urljoin(base_url, wp_thumb["src"])
+                featured_method = "wp-post-image class"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Error reading wp-post-image from %s: %s", base_url, exc)
+
+    if not featured_img:
+        try:
+            tw = soup.find("meta", attrs={"name": "twitter:image"})
+            if tw and tw.get("content"):
+                featured_img = urllib.parse.urljoin(base_url, tw["content"])
+                featured_method = "twitter:image"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Error reading twitter:image from %s: %s", base_url, exc)
+
+    if featured_img:
+        log.info("Found featured image via %s: %s", featured_method, featured_img)
+    else:
+        log.debug("No featured image found for %s", base_url)
+
+    # --- Content image extraction ---
+    content_imgs: list[str] = []
+    seen: set[str] = set()
+    total_img_tags = 0
+    filtered_count = 0
+
+    for img in soup.find_all("img"):
+        total_img_tags += 1
+        try:
+            raw = img.get("src", "")
             if not raw or raw.startswith("data:"):
+                filtered_count += 1
                 continue
+
             absolute = urllib.parse.urljoin(base_url, raw)
             parsed = urllib.parse.urlparse(absolute)
-            # Only keep assets on the same host
-            if parsed.netloc != parsed_base.netloc:
-                continue
-            if absolute not in seen:
-                seen.add(absolute)
-                found.append(absolute)
 
-    return found
+            # Only keep images on the same host.
+            if parsed.netloc != parsed_base.netloc:
+                filtered_count += 1
+                continue
+
+            # Skip theme/WordPress UI images (directory-based check on full path).
+            abs_lower = absolute.lower()
+            if any(frag in abs_lower for frag in _SKIP_IMAGE_DIR_FRAGMENTS):
+                filtered_count += 1
+                continue
+
+            # Skip common UI image names only for images that are NOT in the
+            # uploads directory — content photos live in /wp-content/uploads/
+            # and should never be filtered by name (e.g. logo-design-tips.jpg).
+            if "/wp-content/uploads/" not in abs_lower:
+                filename_lower = abs_lower.rsplit("/", 1)[-1]
+                if any(frag in filename_lower for frag in _SKIP_IMAGE_NAME_FRAGMENTS):
+                    filtered_count += 1
+                    continue
+
+            if absolute in seen:
+                continue
+            seen.add(absolute)
+
+            # Don't duplicate the featured image in the content list.
+            if absolute != featured_img:
+                content_imgs.append(absolute)
+
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Error processing <img> tag from %s: %s", base_url, exc)
+            filtered_count += 1
+
+    log.info(
+        "Found %d content image(s) (scanned %d <img> tags, filtered %d)",
+        len(content_imgs), total_img_tags, filtered_count,
+    )
+    return {"featured": featured_img, "content": content_imgs}
 
 
 # ---------------------------------------------------------------------------
@@ -295,10 +465,10 @@ def download_asset(asset_url: str, assets_dir: Path, timestamp: str) -> str | No
 
 def rewrite_asset_urls(html: str, asset_map: dict[str, str]) -> str:
     """
-    Rewrite asset ``src``/``href`` attribute values in *html* using BeautifulSoup.
+    Rewrite image ``src`` attribute values in *html* using BeautifulSoup.
 
-    Only ``<img src>``, ``<link href>``, and ``<script src>`` attributes are
-    updated, avoiding accidental replacement of text content or unrelated links.
+    Only ``<img src>`` attributes are updated, avoiding accidental replacement
+    of text content or unrelated links.
     *asset_map* maps absolute original URLs to local relative paths; both the
     absolute form and the root-relative path form are matched.
     """
@@ -315,11 +485,10 @@ def rewrite_asset_urls(html: str, asset_map: dict[str, str]) -> str:
             lookup.setdefault(parsed.path, local_path)
 
     soup = BeautifulSoup(html, "lxml")
-    for tag, attr in [("img", "src"), ("link", "href"), ("script", "src")]:
-        for element in soup.find_all(tag):
-            val = element.get(attr, "")
-            if val in lookup:
-                element[attr] = lookup[val]
+    for element in soup.find_all("img"):
+        val = element.get("src", "")
+        if val in lookup:
+            element["src"] = lookup[val]
 
     return str(soup)
 
@@ -430,7 +599,7 @@ def run_dry(index_url: str) -> int:
 
 
 def run_full(index_url: str, output_dir: Path) -> int:
-    """Full recovery: download HTML, assets, rewrite URLs, write WXR."""
+    """Full recovery: download HTML, extract images, rewrite URLs, write WXR."""
     output_dir.mkdir(parents=True, exist_ok=True)
     html_dir = output_dir / "html"
     assets_dir = output_dir / "assets"
@@ -445,25 +614,71 @@ def run_full(index_url: str, output_dir: Path) -> int:
     posts: list[dict] = []
     failures: list[str] = []
 
+    # Running image statistics across all posts.
+    total_featured_found = 0
+    total_featured_downloaded = 0
+    total_content_found = 0
+    total_content_downloaded = 0
+
     for i, rec in enumerate(records, 1):
         original = rec["original"]
         timestamp = rec["timestamp"]
-        log.info("[%d/%d] Fetching: %s", i, len(records), original)
+        log.info("[%d/%d] Processing: %s", i, len(records), original)
 
         html = fetch_html(timestamp, original)
         if html is None:
             failures.append(original)
             continue
 
-        # --- asset extraction and download ---
-        assets = extract_assets(html, original)
-        asset_map: dict[str, str] = {}
-        for asset_url in assets:
-            local_path = download_asset(asset_url, assets_dir, timestamp)
-            if local_path:
-                asset_map[asset_url] = local_path
+        # --- image extraction and download ---
+        try:
+            images = extract_images(html, original)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Image extraction failed for %s: %s — skipping images", original, exc)
+            images = {"featured": None, "content": []}
 
-        # Rewrite asset URLs in the full page HTML (attribute-safe, via BS4)
+        asset_map: dict[str, str] = {}
+
+        # Download featured image first.
+        post_featured_downloaded = 0
+        if images["featured"]:
+            total_featured_found += 1
+            log.info("Downloading featured image...")
+            local_path = download_asset(images["featured"], assets_dir, timestamp)
+            if local_path:
+                asset_map[images["featured"]] = local_path
+                post_featured_downloaded = 1
+                total_featured_downloaded += 1
+                log.info("Downloaded featured image: %s", local_path)
+            else:
+                log.warning("Failed to download featured image: %s", images["featured"])
+
+        # Download content images.
+        content_urls = images["content"]
+        post_content_found = len(content_urls)
+        total_content_found += post_content_found
+        post_content_downloaded = 0
+
+        if content_urls:
+            log.info("Downloading %d content image(s)...", post_content_found)
+            for img_url in content_urls:
+                local_path = download_asset(img_url, assets_dir, timestamp)
+                if local_path:
+                    asset_map[img_url] = local_path
+                    post_content_downloaded += 1
+                    total_content_downloaded += 1
+
+        post_featured_found = 1 if images["featured"] else 0
+        log.info(
+            "Post %d: found %d featured + %d content image(s), downloaded %d/%d",
+            i,
+            post_featured_found,
+            post_content_found,
+            post_featured_downloaded + post_content_downloaded,
+            post_featured_found + post_content_found,
+        )
+
+        # Rewrite image URLs in the full page HTML (attribute-safe, via BS4)
         html_rewritten = rewrite_asset_urls(html, asset_map)
 
         # Extract post metadata and content from the rewritten HTML
@@ -500,7 +715,17 @@ def run_full(index_url: str, output_dir: Path) -> int:
         for url in failures:
             log.warning("  FAILED: %s", url)
 
-    log.info("Recovery complete. Posts: %d, Failures: %d", len(posts), len(failures))
+    log.info("Recovery complete")
+    log.info("Posts processed: %d", len(posts))
+    log.info(
+        "Featured images: %d found, %d downloaded",
+        total_featured_found, total_featured_downloaded,
+    )
+    log.info(
+        "Content images: %d found, %d downloaded",
+        total_content_found, total_content_downloaded,
+    )
+    log.info("Failed URLs: %d", len(failures))
     return 0 if posts else 1
 
 
