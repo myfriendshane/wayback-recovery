@@ -249,8 +249,7 @@ def extract_original_url_from_wayback(url: str) -> str:
         extract_original_url_from_wayback('https://www.currylovers.co.za/image.jpg')
         # -> 'https://www.currylovers.co.za/image.jpg'  (unchanged)
     """
-    pattern = r'https?://web\.archive\.org/web/\d{1,14}[a-z_]*/(https?://.+)$'
-    match = re.match(pattern, url)
+    match = _WAYBACK_UNWRAP_RE.match(url)
     if match:
         return match.group(1)
     return url
@@ -520,6 +519,13 @@ _SKIP_IMAGE_DIR_FRAGMENTS = (
 # WordPress themes and Elementor as the fallback permalink source.
 _ENTRY_TITLE_RE = re.compile(r"entry-title")
 
+# Pre-compiled pattern for stripping the Wayback Machine prefix from a URL.
+# Matches the scheme, host, /web/, timestamp, optional modifier (im_, if_, etc.)
+# and captures the original URL.
+_WAYBACK_UNWRAP_RE = re.compile(
+    r'https?://web\.archive\.org/web/\d{1,14}[a-z_]*/(https?://.+)$'
+)
+
 # Name-based: matched only against the image filename (last path component),
 # to avoid false positives on upload paths like /uploads/logo-design-tips.jpg.
 _SKIP_IMAGE_NAME_FRAGMENTS = (
@@ -574,7 +580,7 @@ def extract_images(html: str, base_url: str) -> dict:
 
     # base_url is the original post URL; the HTML was fetched from the Wayback
     # Machine, so image URLs in the HTML are typically Wayback-wrapped (e.g.
-    # https://web.archive.org/web/TIMESTAMP im_/https://example.com/img.jpg).
+    # https://web.archive.org/web/20251113082400im_/https://example.com/img.jpg).
     # We unwrap before host-checking, but store the original URL so that
     # download_asset() can correctly construct its own Wayback fetch URL.
     base_netloc = parsed_base.netloc
@@ -647,12 +653,13 @@ def extract_images(html: str, base_url: str) -> dict:
     # --- Content image extraction ---
     content_imgs: list[str] = []
     seen: set[str] = set()
-    total_img_tags = len(soup.find_all("img"))
+    img_tags = soup.find_all("img")
+    total_img_tags = len(img_tags)
     filtered_count = 0
 
     log.debug("Scanning %d <img> tag(s) for content images", total_img_tags)
 
-    for img in soup.find_all("img"):
+    for img in img_tags:
         try:
             raw = img.get("src", "")
             if not raw or raw.startswith("data:"):
