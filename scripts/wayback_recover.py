@@ -230,6 +230,32 @@ def parse_wayback_url(url: str) -> tuple[str | None, str | None]:
     return (None, None)
 
 
+def extract_original_url_from_wayback(url: str) -> str:
+    """
+    Extract the original URL from a Wayback-wrapped URL.
+
+    Handles any modifier suffix (``im_``, ``if_``, ``id_``, etc.) and
+    timestamps with 1–14 digits.  Returns *url* unchanged if it is not a
+    Wayback URL.
+
+    Examples::
+
+        extract_original_url_from_wayback(
+            'https://web.archive.org/web/20251113082400im_/'
+            'https://www.currylovers.co.za/image.jpg'
+        )
+        # -> 'https://www.currylovers.co.za/image.jpg'
+
+        extract_original_url_from_wayback('https://www.currylovers.co.za/image.jpg')
+        # -> 'https://www.currylovers.co.za/image.jpg'  (unchanged)
+    """
+    pattern = r'https?://web\.archive\.org/web/\d{1,14}[a-z_]*/(https?://.+)$'
+    match = re.match(pattern, url)
+    if match:
+        return match.group(1)
+    return url
+
+
 def _resolve_wayback_href(href: str, base_ts: str | None, base_orig: str | None, base_url: str) -> str:
     """
     Resolve an href found on a Wayback-archived page to an absolute URL.
@@ -272,8 +298,10 @@ def extract_post_links(html: str, base_url: str) -> list[str]:
     Extract blog post URLs from an archive page's HTML.
 
     Finds all ``<article>`` tags and extracts the permalink ``<a rel="bookmark">``
-    inside each.  Filters results using :func:`should_process_url` to exclude
-    non-post URLs.  Handles absolute Wayback hrefs, root-relative Wayback paths
+    inside each.  Falls back to ``<h2 class="entry-title"> > <a>`` when no
+    bookmark link is present (e.g. Elementor-built archive pages).  Filters
+    results using :func:`should_process_url` to exclude non-post URLs.  Handles
+    absolute Wayback hrefs, root-relative Wayback paths
     (``/web/TIMESTAMP/...``), and plain relative hrefs.
     """
     soup = BeautifulSoup(html, "lxml")
@@ -284,15 +312,26 @@ def extract_post_links(html: str, base_url: str) -> list[str]:
     # properly wrapping any relative hrefs that haven't been rewritten.
     base_ts, base_orig = parse_wayback_url(base_url)
 
-    for article in soup.find_all("article"):
+    articles = soup.find_all("article")
+    log.debug("Found %d <article> tag(s) on page", len(articles))
+
+    for article in articles:
         link_tag = article.find("a", rel="bookmark")
         if not link_tag:
-            continue
+            # Fallback: Elementor and some themes use <h2 class="entry-title"><a>
+            h2 = article.find("h2", class_=_ENTRY_TITLE_RE)
+            if h2:
+                link_tag = h2.find("a")
+            if not link_tag:
+                log.debug("Article has no recognisable permalink link — skipping")
+                continue
+
         href = link_tag.get("href", "")
         if not href:
             continue
 
         absolute = _resolve_wayback_href(href, base_ts, base_orig, base_url)
+        log.debug("Candidate post link: %s", absolute)
 
         if absolute in seen:
             continue
@@ -307,6 +346,7 @@ def extract_post_links(html: str, base_url: str) -> list[str]:
 
         seen.add(absolute)
         post_links.append(absolute)
+        log.debug("Accepted post: %s", url_to_check)
 
     return post_links
 
@@ -476,6 +516,10 @@ _SKIP_IMAGE_DIR_FRAGMENTS = (
     "/wp-includes/",
 )
 
+# Pre-compiled regex for matching the entry-title heading class used by many
+# WordPress themes and Elementor as the fallback permalink source.
+_ENTRY_TITLE_RE = re.compile(r"entry-title")
+
 # Name-based: matched only against the image filename (last path component),
 # to avoid false positives on upload paths like /uploads/logo-design-tips.jpg.
 _SKIP_IMAGE_NAME_FRAGMENTS = (
@@ -528,6 +572,13 @@ def extract_images(html: str, base_url: str) -> dict:
         log.warning("Could not parse base URL %r: %s", base_url, exc)
         return {"featured": None, "content": []}
 
+    # base_url is the original post URL; the HTML was fetched from the Wayback
+    # Machine, so image URLs in the HTML are typically Wayback-wrapped (e.g.
+    # https://web.archive.org/web/TIMESTAMP im_/https://example.com/img.jpg).
+    # We unwrap before host-checking, but store the original URL so that
+    # download_asset() can correctly construct its own Wayback fetch URL.
+    base_netloc = parsed_base.netloc
+
     # --- Featured image detection ---
     featured_img: str | None = None
     featured_method: str = ""
@@ -570,14 +621,19 @@ def extract_images(html: str, base_url: str) -> dict:
             featured_method = ""
         else:
             try:
-                feat_parsed = urllib.parse.urlparse(featured_img)
-                if feat_parsed.netloc and feat_parsed.netloc != parsed_base.netloc:
+                # Unwrap Wayback URL to get the original image URL for host check.
+                featured_original = extract_original_url_from_wayback(featured_img)
+                feat_parsed = urllib.parse.urlparse(featured_original)
+                if feat_parsed.netloc and feat_parsed.netloc != base_netloc:
                     log.warning(
-                        "Featured image is off-host (%s) — ignoring for %s",
-                        feat_parsed.netloc, base_url,
+                        "Featured image is from a different domain (%s) — ignoring: %s",
+                        feat_parsed.netloc, featured_original,
                     )
                     featured_img = None
                     featured_method = ""
+                else:
+                    # Store original URL so download_asset wraps it correctly.
+                    featured_img = featured_original
             except Exception as exc:  # noqa: BLE001
                 log.warning("Could not validate featured image URL %r: %s", featured_img, exc)
                 featured_img = None
@@ -591,47 +647,62 @@ def extract_images(html: str, base_url: str) -> dict:
     # --- Content image extraction ---
     content_imgs: list[str] = []
     seen: set[str] = set()
-    total_img_tags = 0
+    total_img_tags = len(soup.find_all("img"))
     filtered_count = 0
 
+    log.debug("Scanning %d <img> tag(s) for content images", total_img_tags)
+
     for img in soup.find_all("img"):
-        total_img_tags += 1
         try:
             raw = img.get("src", "")
             if not raw or raw.startswith("data:"):
+                log.debug("Skipping empty/data: src")
                 filtered_count += 1
                 continue
 
             absolute = urllib.parse.urljoin(base_url, raw)
-            parsed = urllib.parse.urlparse(absolute)
 
-            # Only keep images on the same host.
-            if parsed.netloc != parsed_base.netloc:
+            # Unwrap Wayback-wrapped URLs before host and path checks; the
+            # archived HTML rewrites every src to a Wayback URL, so comparing
+            # against base_netloc would always fail without unwrapping.
+            original_url = extract_original_url_from_wayback(absolute)
+            parsed = urllib.parse.urlparse(original_url)
+
+            log.debug("Image src: %s  ->  original: %s", absolute, original_url)
+
+            # Only keep images on the same host as the post.
+            if parsed.netloc != base_netloc:
+                log.debug("Skipping off-host image: %s (host: %s)", original_url, parsed.netloc)
                 filtered_count += 1
                 continue
 
-            # Skip theme/WordPress UI images (directory-based check on full path).
-            abs_lower = absolute.lower()
-            if any(frag in abs_lower for frag in _SKIP_IMAGE_DIR_FRAGMENTS):
+            # Skip theme/WordPress UI images (directory-based check on the
+            # original URL path so Wayback prefix doesn't interfere).
+            orig_lower = original_url.lower()
+            if any(frag in orig_lower for frag in _SKIP_IMAGE_DIR_FRAGMENTS):
+                log.debug("Skipping theme/includes image: %s", original_url)
                 filtered_count += 1
                 continue
 
             # Skip common UI image names only for images that are NOT in the
             # uploads directory — content photos live in /wp-content/uploads/
             # and should never be filtered by name (e.g. logo-design-tips.jpg).
-            if "/wp-content/uploads/" not in abs_lower:
-                filename_lower = abs_lower.rsplit("/", 1)[-1]
+            if "/wp-content/uploads/" not in orig_lower:
+                filename_lower = orig_lower.rsplit("/", 1)[-1]
                 if any(frag in filename_lower for frag in _SKIP_IMAGE_NAME_FRAGMENTS):
+                    log.debug("Skipping UI image by name: %s", original_url)
                     filtered_count += 1
                     continue
 
-            if absolute in seen:
+            # Deduplicate using the original URL.
+            if original_url in seen:
                 continue
-            seen.add(absolute)
+            seen.add(original_url)
 
             # Don't duplicate the featured image in the content list.
-            if absolute != featured_img:
-                content_imgs.append(absolute)
+            if original_url != featured_img:
+                log.debug("Accepted content image: %s", original_url)
+                content_imgs.append(original_url)
 
         except Exception as exc:  # noqa: BLE001
             log.warning("Error processing <img> tag from %s: %s", base_url, exc)
@@ -718,7 +789,10 @@ def rewrite_asset_urls(html: str, asset_map: dict[str, str]) -> str:
     Only ``<img src>`` attributes are updated, avoiding accidental replacement
     of text content or unrelated links.
     *asset_map* maps absolute original URLs to local relative paths; both the
-    absolute form and the root-relative path form are matched.
+    absolute form and the root-relative path form are matched.  Wayback-wrapped
+    src values (``https://web.archive.org/web/TIMESTAMP.../URL``) are unwrapped
+    to their original URL before lookup, so the rewriting works even when the
+    archived HTML has Wayback-rewritten image srcs.
     """
     if not asset_map:
         return html
@@ -735,8 +809,18 @@ def rewrite_asset_urls(html: str, asset_map: dict[str, str]) -> str:
     soup = BeautifulSoup(html, "lxml")
     for element in soup.find_all("img"):
         val = element.get("src", "")
+        if not val:
+            continue
         if val in lookup:
             element["src"] = lookup[val]
+            continue
+        # src may be a Wayback-wrapped URL; try the unwrapped original.
+        # Only attempt the second lookup when the URL actually changed (i.e.
+        # it was Wayback-wrapped), to avoid a redundant dict lookup for plain
+        # URLs that already missed the first check.
+        orig_val = extract_original_url_from_wayback(val)
+        if orig_val != val and orig_val in lookup:
+            element["src"] = lookup[orig_val]
 
     return str(soup)
 
