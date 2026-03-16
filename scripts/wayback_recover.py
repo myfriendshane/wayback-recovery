@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-wayback_recover.py — Recover WordPress posts and assets from the Wayback Machine.
+wayback_recover.py — Recover WordPress blog posts and images from the Wayback Machine.
 
 Usage
 -----
@@ -179,6 +179,18 @@ def should_process_url(url: str) -> tuple[bool, str]:
     if not clean:
         return False, "root URL"
 
+    # Reject paths whose last segment ends with a known non-post file extension.
+    # Using an explicit allowlist of extensions avoids false positives on
+    # slugs that legitimately contain dots (e.g. /about-v1.5-release/).
+    _NON_POST_EXTENSIONS = (
+        ".php", ".xml", ".txt", ".json", ".rss", ".atom",
+        ".css", ".js", ".html", ".htm",
+    )
+    last_segment = clean.rsplit("/", 1)[-1]
+    for ext in _NON_POST_EXTENSIONS:
+        if last_segment.endswith(ext):
+            return False, f"path has non-post file extension ('{last_segment}')"
+
     return True, ""
 
 
@@ -334,6 +346,28 @@ def extract_images(html: str, base_url: str) -> dict:
                 featured_method = "twitter:image"
         except Exception as exc:  # noqa: BLE001
             log.warning("Error reading twitter:image from %s: %s", base_url, exc)
+
+    if featured_img:
+        # Apply the same basic safety checks as content images: reject data:
+        # URIs and off-host URLs so run_full() never tries to download them.
+        if featured_img.startswith("data:"):
+            log.warning("Featured image is a data: URI — ignoring (%s)", base_url)
+            featured_img = None
+            featured_method = ""
+        else:
+            try:
+                feat_parsed = urllib.parse.urlparse(featured_img)
+                if feat_parsed.netloc and feat_parsed.netloc != parsed_base.netloc:
+                    log.warning(
+                        "Featured image is off-host (%s) — ignoring for %s",
+                        feat_parsed.netloc, base_url,
+                    )
+                    featured_img = None
+                    featured_method = ""
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not validate featured image URL %r: %s", featured_img, exc)
+                featured_img = None
+                featured_method = ""
 
     if featured_img:
         log.info("Found featured image via %s: %s", featured_method, featured_img)
@@ -613,6 +647,7 @@ def run_full(index_url: str, output_dir: Path) -> int:
 
     posts: list[dict] = []
     failures: list[str] = []
+    failed_images: list[str] = []
 
     # Running image statistics across all posts.
     total_featured_found = 0
@@ -652,6 +687,7 @@ def run_full(index_url: str, output_dir: Path) -> int:
                 log.info("Downloaded featured image: %s", local_path)
             else:
                 log.warning("Failed to download featured image: %s", images["featured"])
+                failed_images.append(images["featured"])
 
         # Download content images.
         content_urls = images["content"]
@@ -667,6 +703,8 @@ def run_full(index_url: str, output_dir: Path) -> int:
                     asset_map[img_url] = local_path
                     post_content_downloaded += 1
                     total_content_downloaded += 1
+                else:
+                    failed_images.append(img_url)
 
         post_featured_found = 1 if images["featured"] else 0
         log.info(
@@ -711,9 +749,14 @@ def run_full(index_url: str, output_dir: Path) -> int:
         log.error("No posts were successfully recovered.")
 
     if failures:
-        log.warning("%d URL(s) failed to download:", len(failures))
+        log.warning("%d page(s) failed to download:", len(failures))
         for url in failures:
-            log.warning("  FAILED: %s", url)
+            log.warning("  FAILED PAGE: %s", url)
+
+    if failed_images:
+        log.warning("%d image(s) failed to download:", len(failed_images))
+        for url in failed_images:
+            log.warning("  FAILED IMAGE: %s", url)
 
     log.info("Recovery complete")
     log.info("Posts processed: %d", len(posts))
@@ -725,7 +768,7 @@ def run_full(index_url: str, output_dir: Path) -> int:
         "Content images: %d found, %d downloaded",
         total_content_found, total_content_downloaded,
     )
-    log.info("Failed URLs: %d", len(failures))
+    log.info("Failed pages: %d, Failed images: %d", len(failures), len(failed_images))
     return 0 if posts else 1
 
 
@@ -736,7 +779,7 @@ def run_full(index_url: str, output_dir: Path) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="wayback_recover.py",
-        description="Recover WordPress posts and assets from the Wayback Machine.",
+        description="Recover WordPress blog posts and images from the Wayback Machine.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
