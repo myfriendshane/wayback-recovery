@@ -14,11 +14,19 @@ Usage
       --output-dir ./output \
       --mode full
 
+  # Direct Wayback archive URL (for sites saved via "Save Page Now"):
+  python scripts/wayback_recover.py \
+      --index-url "https://web.archive.org/web/20251113082400/https://example.com/blog/" \
+      --output-dir ./output \
+      --mode full
+
 Flags
 -----
-  --index-url   The original site URL to recover (required).
+  --index-url   The original site URL to recover, or a Wayback Machine archive
+                URL (https://web.archive.org/web/TIMESTAMP/ORIGINAL_URL).
+                Required.
   --output-dir  Directory to write recovered HTML, assets, and WXR (required).
-  --mode        dry-run  — query CDX and list snapshots; no files written.
+  --mode        dry-run  — query CDX / inspect archive page; no files written.
                 full     — download HTML, extract images, write WXR.
 
 Exit codes
@@ -32,6 +40,9 @@ Requirements
 
 Notes
 -----
+  - When --index-url is a Wayback Machine URL the CDX API is not used; post
+    links are extracted directly from the archived index page with pagination
+    followed automatically.
   - Respects the Wayback Machine's Retry-After header on 429/503 responses.
   - Uses exponential back-off (up to MAX_RETRIES attempts) on transient errors.
   - Only the latest successful (HTTP 200) CDX snapshot is used per URL.
@@ -192,6 +203,124 @@ def should_process_url(url: str) -> tuple[bool, str]:
             return False, f"path has non-post file extension ('{last_segment}')"
 
     return True, ""
+
+
+def parse_wayback_url(url: str) -> tuple[str | None, str | None]:
+    """
+    Parse a Wayback Machine URL.
+
+    Returns ``(timestamp, original_url)`` if *url* is a Wayback URL,
+    otherwise ``(None, None)``.
+
+    Supports optional modifiers (``if_``, ``id_``, ``js_``, ``cs_``, ``im_``)
+    between the timestamp and the original URL.
+
+    Example::
+
+        parse_wayback_url(
+            'https://web.archive.org/web/20251113082400/'
+            'https://www.currylovers.co.za/curry-school/'
+        )
+        # -> ('20251113082400', 'https://www.currylovers.co.za/curry-school/')
+    """
+    pattern = r'https?://web\.archive\.org/web/(\d{14})(?:id_|if_|js_|cs_|im_)?/(https?://.+)$'
+    match = re.match(pattern, url)
+    if match:
+        return (match.group(1), match.group(2))
+    return (None, None)
+
+
+def extract_post_links(html: str, base_url: str) -> list[str]:
+    """
+    Extract blog post URLs from an archive page's HTML.
+
+    Finds all ``<article>`` tags and extracts the permalink ``<a rel="bookmark">``
+    inside each.  Filters results using :func:`should_process_url` to exclude
+    non-post URLs.  Both Wayback-rewritten and relative hrefs are handled.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    post_links: list[str] = []
+    seen: set[str] = set()
+
+    # If base_url is a Wayback URL, extract the timestamp + original for
+    # properly wrapping any relative hrefs that haven't been rewritten.
+    base_ts, base_orig = parse_wayback_url(base_url)
+
+    for article in soup.find_all("article"):
+        link_tag = article.find("a", rel="bookmark")
+        if not link_tag:
+            continue
+        href = link_tag.get("href", "")
+        if not href:
+            continue
+
+        if href.startswith("https://web.archive.org/web/"):
+            absolute = href
+        elif base_ts and base_orig:
+            # Resolve relative to the original URL, then wrap in a Wayback URL.
+            original_absolute = urllib.parse.urljoin(base_orig, href)
+            absolute = f"{WAYBACK_BASE}/{base_ts}/{original_absolute}"
+        else:
+            absolute = urllib.parse.urljoin(base_url, href)
+
+        if absolute in seen:
+            continue
+
+        # For Wayback-rewritten links, evaluate the original URL for filtering.
+        ts, orig = parse_wayback_url(absolute)
+        url_to_check = orig if orig else absolute
+        include, reason = should_process_url(url_to_check)
+        if not include:
+            log.debug("Skipping post link %s — %s", absolute, reason)
+            continue
+
+        seen.add(absolute)
+        post_links.append(absolute)
+
+    return post_links
+
+
+def extract_pagination_links(html: str, current_page_url: str) -> list[str]:
+    """
+    Extract pagination URLs from an archive page's HTML.
+
+    Looks for a ``<nav>`` element whose ``class`` attribute includes
+    ``"pagination"`` and collects all ``<a class="page-numbers">`` hrefs,
+    excluding the current page.
+    Returns a list of absolute Wayback URLs (or absolute URLs if not Wayback-
+    rewritten), preserving document order with duplicates removed.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    nav = soup.find("nav", class_="pagination")
+    if not nav:
+        return []
+
+    # If current_page_url is a Wayback URL, extract the timestamp + original
+    # for properly wrapping any relative hrefs.
+    base_ts, base_orig = parse_wayback_url(current_page_url)
+
+    pagination_urls: list[str] = []
+    seen: set[str] = set()
+
+    for link in nav.find_all("a", class_="page-numbers"):
+        href = link.get("href", "")
+        if not href:
+            continue
+
+        if href.startswith("https://web.archive.org/web/"):
+            absolute = href
+        elif base_ts and base_orig:
+            original_absolute = urllib.parse.urljoin(base_orig, href)
+            absolute = f"{WAYBACK_BASE}/{base_ts}/{original_absolute}"
+        else:
+            absolute = urllib.parse.urljoin(current_page_url, href)
+
+        if absolute in seen or absolute == current_page_url:
+            continue
+        seen.add(absolute)
+        pagination_urls.append(absolute)
+
+    return pagination_urls
 
 
 def query_cdx(index_url: str) -> list[dict]:
@@ -617,7 +746,58 @@ def extract_pub_date(soup: BeautifulSoup) -> str:
 # ---------------------------------------------------------------------------
 
 def run_dry(index_url: str) -> int:
-    """Perform CDX discovery only; print snapshot list; return exit code."""
+    """Perform discovery only; print snapshot/post list; return exit code."""
+    timestamp, original_url = parse_wayback_url(index_url)
+
+    if timestamp and original_url:
+        log.info("Detected Wayback archive URL")
+        log.info("Timestamp: %s", timestamp)
+        log.info("Original URL: %s", original_url)
+
+        archive_html = fetch_html(timestamp, original_url)
+        if not archive_html:
+            log.error("Failed to fetch archive page")
+            return 1
+
+        post_links = extract_post_links(archive_html, index_url)
+        post_links_seen: set[str] = set(post_links)
+        log.info("Found %d posts on page 1", len(post_links))
+
+        pagination_urls = extract_pagination_links(archive_html, index_url)
+        log.info("Found %d additional page(s)", len(pagination_urls))
+
+        for page_num, page_url in enumerate(pagination_urls, 2):
+            log.info("Fetching page %d: %s", page_num, page_url)
+            page_ts, page_orig = parse_wayback_url(page_url)
+            if not page_ts or not page_orig:
+                log.warning("Could not parse pagination URL: %s — skipping", page_url)
+                continue
+            page_html = fetch_html(page_ts, page_orig)
+            if page_html:
+                page_posts = extract_post_links(page_html, page_url)
+                log.info("Found %d posts on page %d", len(page_posts), page_num)
+                for link in page_posts:
+                    if link not in post_links_seen:
+                        post_links_seen.add(link)
+                        post_links.append(link)
+
+        log.info("Total posts found across all pages: %d", len(post_links))
+
+        if not post_links:
+            log.error("No post links found — nothing to recover.")
+            return 1
+
+        print(f"\nFound {len(post_links)} post(s) from {index_url}:\n")
+        for i, link in enumerate(post_links[:50], 1):
+            ts_p, orig_p = parse_wayback_url(link)
+            display = orig_p if orig_p else link
+            print(f"  [{i}] {display}")
+        if len(post_links) > 50:
+            print(f"  … and {len(post_links) - 50} more.")
+        print()
+        return 0
+
+    # Not a Wayback URL — use CDX API.
     records = query_cdx(index_url)
     if not records:
         log.error("No snapshots found — nothing to recover.")
@@ -640,11 +820,6 @@ def run_full(index_url: str, output_dir: Path) -> int:
     html_dir.mkdir(exist_ok=True)
     assets_dir.mkdir(exist_ok=True)
 
-    records = query_cdx(index_url)
-    if not records:
-        log.error("No snapshots found — nothing to recover.")
-        return 1
-
     posts: list[dict] = []
     failures: list[str] = []
     failed_images: list[str] = []
@@ -654,6 +829,66 @@ def run_full(index_url: str, output_dir: Path) -> int:
     total_featured_downloaded = 0
     total_content_found = 0
     total_content_downloaded = 0
+
+    # ------------------------------------------------------------------
+    # Determine the list of (timestamp, original_url) pairs to process.
+    # ------------------------------------------------------------------
+    timestamp, original_url = parse_wayback_url(index_url)
+
+    if timestamp and original_url:
+        log.info("Detected Wayback archive URL")
+        log.info("Timestamp: %s", timestamp)
+        log.info("Original URL: %s", original_url)
+
+        archive_html = fetch_html(timestamp, original_url)
+        if not archive_html:
+            log.error("Failed to fetch archive page")
+            return 1
+
+        post_links = extract_post_links(archive_html, index_url)
+        post_links_seen: set[str] = set(post_links)
+        log.info("Found %d posts on page 1", len(post_links))
+
+        pagination_urls = extract_pagination_links(archive_html, index_url)
+        log.info("Found %d additional page(s)", len(pagination_urls))
+
+        for page_num, page_url in enumerate(pagination_urls, 2):
+            log.info("Fetching page %d: %s", page_num, page_url)
+            page_ts, page_orig = parse_wayback_url(page_url)
+            if not page_ts or not page_orig:
+                log.warning("Could not parse pagination URL: %s — skipping", page_url)
+                continue
+            page_html = fetch_html(page_ts, page_orig)
+            if page_html:
+                page_posts = extract_post_links(page_html, page_url)
+                log.info("Found %d posts on page %d", len(page_posts), page_num)
+                for link in page_posts:
+                    if link not in post_links_seen:
+                        post_links_seen.add(link)
+                        post_links.append(link)
+
+        log.info("Total posts found across all pages: %d", len(post_links))
+
+        if not post_links:
+            log.error("No post links found — nothing to recover.")
+            return 1
+
+        # Build records list from the collected post links.
+        records: list[dict] = []
+        for link in post_links:
+            post_ts, post_orig = parse_wayback_url(link)
+            if post_ts and post_orig:
+                records.append({"timestamp": post_ts, "original": post_orig})
+            else:
+                log.warning("Skipping unparseable post link: %s", link)
+
+    else:
+        # Not a Wayback URL — use CDX API (existing flow).
+        log.info("Querying CDX API for: %s", index_url)
+        records = query_cdx(index_url)
+        if not records:
+            log.error("No snapshots found — nothing to recover.")
+            return 1
 
     for i, rec in enumerate(records, 1):
         original = rec["original"]
@@ -787,7 +1022,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--index-url",
         required=True,
         metavar="URL",
-        help="Original site URL to recover (e.g. https://example.com/).",
+        help=(
+            "Original site URL to recover (e.g. https://example.com/), "
+            "or a direct Wayback Machine archive URL "
+            "(e.g. https://web.archive.org/web/TIMESTAMP/https://example.com/blog/)."
+        ),
     )
     parser.add_argument(
         "--output-dir",
